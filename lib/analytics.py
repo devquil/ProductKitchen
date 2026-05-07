@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import List, Optional
 
-from models.task import Task, TaskStatus, Priority
+from models.task import Task, TaskStatus, Priority, TASK_TAGS
 from models.habit import Habit
 from lib import store
 
@@ -17,8 +17,8 @@ class EfficiencySignal:
 
 def task_score(tasks: List[Task]) -> float:
     """
-    Task efficiency: how many done vs estimated.
-    Also penalises overdue HIGH priority tasks.
+    Task efficiency: completions weighted by tag importance.
+    Business tasks count 3x more than hobby tasks.
     """
     if not tasks:
         return 0.0
@@ -26,27 +26,28 @@ def task_score(tasks: List[Task]) -> float:
     completed = [t for t in tasks if t.status == TaskStatus.DONE]
     if not completed:
         # All pending/in-progress — measure effort vs deadline
-        effort = sum(t.actual_hours for t in tasks if t.status == TaskStatus.IN_PROGRESS)
-        total_est = sum(t.estimated_hours for t in tasks)
+        effort = sum(t.actual_hours * t.tag_weight() for t in tasks if t.status == TaskStatus.IN_PROGRESS)
+        total_est = sum(t.estimated_hours * t.tag_weight() for t in tasks)
         if total_est == 0:
             return 0.0
         effort_ratio = min(effort / total_est, 1.0)
         return effort_ratio * 0.7  # can't get full score without completing
 
-    # Completion rate weighted by priority
-    total_weight = sum(p.value for p in [t.priority for t in completed])
-    max_weight = total_weight  # simplified
+    # Weighted completion: each completed task's weight = tag_weight
+    total_weight = sum(t.tag_weight() for t in completed)
+    max_possible_weight = sum(t.tag_weight() for t in tasks)
+    completion_rate = total_weight / max_possible_weight if max_possible_weight > 0 else 0.0
 
-    # Average efficiency across completed tasks
-    avg_eff = sum(t.efficiency for t in completed) / len(completed) if completed else 0.0
-    completion_rate = len(completed) / len(tasks)
+    # Average efficiency across completed tasks (also weighted)
+    total_eff_weight = sum(t.efficiency * t.tag_weight() for t in completed)
+    avg_eff = total_eff_weight / total_weight if total_weight > 0 else 0.0
 
-    # Blend: 60% completion, 40% speed
+    # Blend: 60% completion (tag-weighted), 40% speed
     score = completion_rate * 0.6 + min(avg_eff, 1.0) * 0.4
 
     # Penalise overdue high-priority tasks still open
     overdue_penalty = sum(
-        0.05 * t.priority.value
+        0.05 * t.priority.value * t.tag_weight()
         for t in tasks
         if t.is_overdue and t.status != TaskStatus.DONE
     )
@@ -55,7 +56,8 @@ def task_score(tasks: List[Task]) -> float:
 
 def habit_score(habits: List[Habit]) -> float:
     """
-    Habit score: hours logged today vs goal across all habits.
+    Habit score: block hours logged today vs goal across all habits.
+    Only counts hours from work blocks linked to tasks — no loose entries.
     """
     if not habits:
         return 0.0
@@ -63,9 +65,8 @@ def habit_score(habits: List[Habit]) -> float:
     today = date.today()
     scores = []
     for habit in habits:
-        entries = store.get_habit_entries(habit_id=habit.id)
-        today_entries = [e for e in entries if e.date == today]
-        today_hours = sum(e.hours_worked for e in today_entries)
+        blocks = store.get_habit_blocks(habit_id=habit.id)
+        today_hours = sum(b.duration_hours for b in blocks if b.date == today and b.duration_hours > 0)
         progress = min(today_hours / habit.goal_hours, 1.0)
         scores.append(progress)
 
@@ -147,24 +148,20 @@ def weekly_summary(tasks: List[Task], habits: List[Habit]) -> dict:
         if t.completed_at and date.fromisoformat(t.completed_at.isoformat()[:10]) >= week_start
     ]
 
-    # Hours this week
-    habit_ids = [h.id for h in habits]
-    all_entries = []
-    for hid in habit_ids:
-        all_entries.extend(store.get_habit_entries(habit_id=hid))
-    week_entries = [
-        e for e in all_entries
-        if week_start <= e.date <= week_end
-    ]
-    total_hours = sum(e.hours_worked for e in week_entries)
+    # Hours this week — from blocks only (linked to tasks)
+    all_blocks = []
+    for h in habits:
+        all_blocks.extend(store.get_habit_blocks(habit_id=h.id))
+    week_blocks = [b for b in all_blocks if week_start <= b.date <= week_end]
+    total_hours = sum(b.duration_hours for b in week_blocks)
 
     # By-day breakdown
     days = {}
     for i in range(7):
         d = week_start + timedelta(days=i)
-        day_entries = [e for e in week_entries if e.date == d]
+        day_blocks = [b for b in week_blocks if b.date == d]
         days[d.isoformat()] = {
-            "hours": sum(e.hours_worked for e in day_entries),
+            "hours": sum(b.duration_hours for b in day_blocks),
             "tasks_done": len([
                 t for t in week_tasks
                 if t.completed_at and date.fromisoformat(t.completed_at.isoformat()[:10]) == d
@@ -178,3 +175,78 @@ def weekly_summary(tasks: List[Task], habits: List[Habit]) -> dict:
         "total_hours": total_hours,
         "by_day": days,
     }
+
+
+def tag_scores(tasks: List[Task]) -> dict:
+    """
+    Returns per-tag progress breakdown.
+    Each tag shows: completed_weight / total_weight, hours logged, task counts.
+    """
+    result = {}
+    for tag_key, tag_info in TASK_TAGS.items():
+        tag_tasks = [t for t in tasks if t.tag == tag_key]
+        if not tag_tasks:
+            result[tag_key] = {
+                "label": tag_info["label"],
+                "color": tag_info["color"],
+                "weight": tag_info["weight"],
+                "description": tag_info["description"],
+                "score": 0.0,
+                "total": 0,
+                "done": 0,
+                "hours": 0.0,
+            }
+            continue
+
+        completed = [t for t in tag_tasks if t.status == TaskStatus.DONE]
+        total_weight = sum(t.tag_weight() for t in tag_tasks)
+        done_weight = sum(t.tag_weight() for t in completed)
+        total_hours = sum(t.actual_hours for t in tag_tasks)
+
+        # Score: completion rate × efficiency blend (same formula as task_score but per tag)
+        completion_rate = done_weight / total_weight if total_weight > 0 else 0.0
+        avg_eff = (sum(t.efficiency for t in completed) / len(completed)) if completed else 0.0
+        score = completion_rate * 0.6 + min(avg_eff, 1.0) * 0.4
+
+        result[tag_key] = {
+            "label": tag_info["label"],
+            "color": tag_info["color"],
+            "weight": tag_info["weight"],
+            "description": tag_info["description"],
+            "score": score,
+            "total": len(tag_tasks),
+            "done": len(completed),
+            "hours": total_hours,
+        }
+    return result
+
+
+def current_streak(habits):
+    """
+    Returns the number of consecutive days (ending today) where the combined
+    habit block hours met or exceeded the combined daily goal.
+    """
+    if not habits:
+        return 0
+
+    today = date.today()
+    total_goal = sum(h.goal_hours for h in habits)
+
+    from collections import defaultdict
+    day_hours = defaultdict(float)
+    for h in habits:
+        blocks = store.get_habit_blocks(habit_id=h.id)
+        for b in blocks:
+            day_hours[b.date] += b.duration_hours
+
+    streak = 0
+    check_date = today
+    while True:
+        hrs = day_hours.get(check_date, 0.0)
+        if hrs >= total_goal:
+            streak += 1
+            check_date -= timedelta(days=1)
+        else:
+            break
+
+    return streak

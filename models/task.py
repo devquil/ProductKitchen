@@ -18,6 +18,15 @@ class TaskStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+# Tag system with weights — business is highest priority
+TASK_TAGS = {
+    "business":   {"label": "💼 Business",  "weight": 3.0, "color": "#ef4444", "description": "Revenue-generating work — highest priority"},
+    "fitness":    {"label": "💪 Fitness",   "weight": 1.5, "color": "#22c55e", "description": "Health & physical training"},
+    "hobby":      {"label": "🎨 Hobby",    "weight": 1.0, "color": "#8b5cf6", "description": "Creative / leisure activities"},
+    "personal":   {"label": "🏠 Personal", "weight": 1.2, "color": "#06b6d4", "description": "Life admin & personal projects"},
+}
+
+
 @dataclass
 class Task:
     id: str
@@ -31,11 +40,14 @@ class Task:
     completed_at: Optional[datetime] = None
     estimated_hours: float = 1.0
     actual_hours: float = 0.0
-    efficiency: float = 0.0  # calculated: estimated / actual (higher = faster)
+    efficiency: float = 0.0
+    tag: str = "personal"   # one of: business, fitness, hobby, personal
+    habit_id: Optional[str] = None  # optional link to a habit tracker habit
 
     @staticmethod
     def create(title: str, description: str = "", priority: Priority = Priority.MEDIUM,
-               due_date: Optional[datetime] = None, estimated_hours: float = 1.0) -> "Task":
+               due_date: Optional[datetime] = None, estimated_hours: float = 1.0,
+               tag: str = "personal", habit_id: Optional[str] = None) -> "Task":
         return Task(
             id=str(uuid.uuid4()),
             title=title,
@@ -43,7 +55,12 @@ class Task:
             priority=priority,
             due_date=due_date,
             estimated_hours=estimated_hours,
+            tag=tag,
+            habit_id=habit_id,
         )
+
+    def tag_weight(self) -> float:
+        return TASK_TAGS.get(self.tag, TASK_TAGS["personal"])["weight"]
 
     def start(self):
         self.status = TaskStatus.IN_PROGRESS
@@ -90,6 +107,8 @@ class Task:
             "estimated_hours": self.estimated_hours,
             "actual_hours": self.actual_hours,
             "efficiency": self.efficiency,
+            "tag": self.tag,
+            "habit_id": self.habit_id,
         }
 
     @classmethod
@@ -107,4 +126,6 @@ class Task:
             estimated_hours=d.get("estimated_hours", 1.0),
             actual_hours=d.get("actual_hours", 0.0),
             efficiency=d.get("efficiency", 0.0),
+            tag=d.get("tag", "personal"),
+            habit_id=d.get("habit_id"),
         )
